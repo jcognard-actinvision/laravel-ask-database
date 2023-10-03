@@ -3,6 +3,7 @@
 namespace BeyondCode\Oracle;
 
 use BeyondCode\Oracle\Exceptions\PotentiallyUnsafeQuery;
+use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use OpenAI\Client;
@@ -16,7 +17,7 @@ class Oracle
         $this->connection = config('ask-database.connection');
     }
 
-    public function ask(string $question): string
+    public function ask(string $question): array
     {
         $query = $this->getQuery($question);
 
@@ -26,9 +27,12 @@ class Oracle
 
         $answer = $this->queryOpenAi($prompt, "\n", 0.7);
 
-        return Str::of($answer)
-            ->trim()
-            ->trim('"');
+        return [
+            'query' => $query,
+            'result' => $result,
+            'prompt' => $prompt,
+            'answer' => Str::of($answer)->trim()->trim('"'),
+        ];
     }
 
     public function getQuery(string $question): string
@@ -36,7 +40,12 @@ class Oracle
         $prompt = $this->buildPrompt($question);
 
         $query = $this->queryOpenAi($prompt, "\n");
-        $query = Str::of($query)
+        $splittedQuery = Str::of($query)->split("/\n/");
+        $query = Str::of(
+                $splittedQuery
+                ->take($splittedQuery->count() - 2)
+                ->join(' ')
+            )
             ->trim()
             ->trim('"');
 
@@ -48,11 +57,12 @@ class Oracle
     protected function queryOpenAi(string $prompt, string $stop, float $temperature = 0.0)
     {
         $completions = $this->client->completions()->create([
-            'model' => 'text-davinci-003',
-            'prompt' => $prompt,
-            'temperature' => $temperature,
-            'max_tokens' => 100,
-            'stop' => $stop,
+            'messages' => [
+                [
+                    'role' => 'user',
+                    'content' => $prompt,
+                ],
+            ],
         ]);
 
         return $completions->choices[0]->text;
@@ -73,9 +83,9 @@ class Oracle
         return rtrim($prompt, PHP_EOL);
     }
 
-    protected function evaluateQuery(string $query): object
+    protected function evaluateQuery(string $query): object|array
     {
-        return DB::connection($this->connection)->select($this->getRawQuery($query))[0] ?? new \stdClass();
+        return DB::connection($this->connection)->select($this->getRawQuery($query)) ?? new \stdClass();
     }
 
     protected function getRawQuery(string $query): string
@@ -93,7 +103,7 @@ class Oracle
      */
     protected function ensureQueryIsSafe(string $query): void
     {
-        if (! config('ask-database.strict_mode')) {
+        if (!config('ask-database.strict_mode')) {
             return;
         }
 
@@ -135,14 +145,16 @@ class Oracle
         ]);
         $prompt = rtrim($prompt, PHP_EOL);
 
-        $matchingTablesResult = $this->queryOpenAi($prompt, "\n");
+        $matchingTables = $this->queryOpenAi($prompt, "\n");
 
-        $matchingTables = Str::of($matchingTablesResult)
+        Str::of($matchingTables)
             ->explode(',')
-            ->transform(fn (string $tableName) => strtolower(trim($tableName)));
+            ->transform(fn (string $tableName) => trim($tableName))
+            ->filter()
+            ->each(function (string $tableName) use (&$tables) {
+                $tables = array_filter($tables, fn ($table) => strtolower($table->getName()) === strtolower($tableName));
+            });
 
-        return collect($tables)->filter(function ($table) use ($matchingTables) {
-            return $matchingTables->contains(strtolower($table->getName()));
-        })->toArray();
+        return $tables;
     }
 }
